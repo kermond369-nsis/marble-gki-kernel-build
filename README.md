@@ -8,8 +8,11 @@ GitHub Actions 一键编译带 **Droidspaces 容器支持 + KernelSU** 的 GKI 5
 2. 参数：
    - `droidspaces_slot`：SYSVIPC kABI 补丁槽位，默认 `678`（官方推荐）；刷入后 bootloop 则换 `123` 或 `345` 重试
    - `kernel_branch`：GKI 内核分支，默认 `android12-5.10-lts`（持续收安全补丁）
+   - `create_release`：构建完成后自动发布 GitHub Release（默认开启，产物长期保留）
 3. 等待约 30-60 分钟（含源码同步与编译）
-4. 运行完成后在 workflow 页面 **Summary** 底部下载 `marble-gki-5.10-*-AnyKernel3.zip` artifact
+4. 运行完成后：
+   - 仓库 **Releases** 页下载 `marble-gki-5.10-*-AnyKernel3.zip`（推荐，长期保留）
+   - 或 workflow 页面 **Summary** 底部下载同名 artifact（仅保留 14 天）
 
 ## 产物说明
 
