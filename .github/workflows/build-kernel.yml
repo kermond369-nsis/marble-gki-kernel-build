@@ -1,0 +1,208 @@
+name: 构建 GKI 5.10 内核 (Droidspaces + KernelSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      droidspaces_slot:
+        description: 'Droidspaces SYSVIPC kABI 补丁槽位 (刷入后 bootloop 则换 123/345 重试)'
+        required: true
+        type: choice
+        default: '678'
+        options:
+          - '678'
+          - '123'
+          - '345'
+          - 'off'
+      kernel_branch:
+        description: 'AOSP GKI 内核分支'
+        required: true
+        type: choice
+        default: 'android12-5.10-lts'
+        options:
+          - 'android12-5.10-lts'
+          - 'android12-5.10-2025-12'
+          - 'android12-5.10-2025-09'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 'GKI ${{ inputs.kernel_branch }} / DS-${{ inputs.droidspaces_slot }}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_HARDLINK: 'true'
+      KERNEL_ROOT: '${{ github.workspace }}/kernel-src'
+      DEFCONFIG: '${{ github.workspace }}/kernel-src/common/arch/arm64/configs/gki_defconfig'
+
+    steps:
+      - name: 清理磁盘空间
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: 'azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* mysql* dotnet-sdk-*'
+          remove_packages_one_command: true
+          rm_cmd: 'rmz'
+          rmz_version: '3.1.1'
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves zip
+          git config --global user.name 'BuildBot'
+          git config --global user.email 'buildbot@localhost'
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-
+            ccache-${{ runner.os }}-
+
+      - name: 下载 repo 工具
+        run: |
+          mkdir -p "${{ github.workspace }}/git-repo"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "${{ github.workspace }}/git-repo/repo"
+          chmod 0755 "${{ github.workspace }}/git-repo/repo"
+          echo "${{ github.workspace }}/git-repo" >> "$GITHUB_PATH"
+
+      - name: 下载 AOSP build-tools
+        run: |
+          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-build-2024 --depth 1 "${{ github.workspace }}/kernel-build-tools"
+          echo "${{ github.workspace }}/kernel-build-tools/linux-x86/bin" >> "$GITHUB_PATH"
+
+      - name: 同步 AOSP GKI 内核源码
+        run: |
+          mkdir -p "$KERNEL_ROOT"
+          cd "$KERNEL_ROOT"
+          MANIFEST_BRANCH="common-${{ inputs.kernel_branch }}"
+          echo "初始化 repo manifest: $MANIFEST_BRANCH"
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH" --repo-rev=v2.16
+          # 处理已弃用分支 (deprecated/ 前缀)
+          REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common "${{ inputs.kernel_branch }}")
+          if grep -q deprecated <<< "$REMOTE_BRANCH"; then
+            echo "检测到已弃用分支，应用 deprecated/ 前缀"
+            sed -i "s/\"${{ inputs.kernel_branch }}\"/\"deprecated\/${{ inputs.kernel_branch }}\"/g" .repo/manifests/default.xml
+          fi
+          repo --trace sync -c -j"$(nproc --all)" --no-tags --fail-fast
+
+      - name: 集成 Droidspaces 支持
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          git clone --depth 1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
+          PATCHES=/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI
+          SLOT="${{ inputs.droidspaces_slot }}"
+
+          if [ "$SLOT" != "off" ]; then
+            # 678 -> 6_7_8
+            SLOT_NAME=$(echo "$SLOT" | sed 's/\(.\)/\1_/g; s/_$//')
+            echo "应用 Droidspaces SYSVIPC kABI 修复补丁 (槽位: $SLOT_NAME)"
+            patch -p1 --forward < "$PATCHES/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_${SLOT_NAME}.patch" \
+              || echo "::warning::SYSVIPC 补丁应用失败(可能已应用或上下文不匹配)"
+            # 5.10 必须的 POSIX_MQUEUE kABI 补丁
+            echo "应用 Droidspaces POSIX_MQUEUE kABI 修复补丁 (5.10)"
+            patch -p1 --forward < "$PATCHES/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch" \
+              || echo "::warning::POSIX_MQUEUE 补丁应用失败(可能已应用或上下文不匹配)"
+          else
+            echo "Droidspaces 支持: 关闭"
+          fi
+
+          echo "注入 Droidspaces 内核配置..."
+          enable_config() {
+            local cfg="$1"
+            if grep -q "^${cfg}=y" "$DEFCONFIG"; then
+              echo "  已启用: $cfg"
+            elif grep -q "^# ${cfg} is not set" "$DEFCONFIG"; then
+              sed -i "s/^# ${cfg} is not set$/${cfg}=y/" "$DEFCONFIG"
+              echo "  已切换: $cfg"
+            else
+              echo "${cfg}=y" >> "$DEFCONFIG"
+              echo "  已添加: $cfg"
+            fi
+          }
+          config_defined() {
+            local name="${1#CONFIG_}"
+            grep -RqsE --include='Kconfig*' "^[[:space:]]*(menuconfig|config)[[:space:]]+${name}$" .
+          }
+          enable_config_if_defined() {
+            local cfg="$1"
+            if config_defined "$cfg"; then
+              enable_config "$cfg"
+            else
+              echo "  内核未定义, 跳过: $cfg"
+            fi
+          }
+
+          # 必要配置
+          enable_config CONFIG_SYSVIPC
+          enable_config CONFIG_POSIX_MQUEUE
+          enable_config CONFIG_IPC_NS
+          enable_config CONFIG_PID_NS
+          enable_config CONFIG_DEVTMPFS
+          # 网络增强 (Docker/NAT)
+          enable_config_if_defined CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          # 可选推荐
+          enable_config_if_defined CONFIG_USER_NS
+          enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_REJECT
+          enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_LOG
+          enable_config_if_defined CONFIG_IP_SET
+          enable_config_if_defined CONFIG_IP_SET_HASH_IP
+          enable_config_if_defined CONFIG_TMPFS_POSIX_ACL
+          enable_config_if_defined CONFIG_TMPFS_XATTR
+
+      - name: 集成 KernelSU (官方内置)
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          cd KernelSU
+          KSU_VERSION=$((20000 + $(git rev-list --count HEAD)))
+          echo "KSU_VERSION=$KSU_VERSION" >> "$GITHUB_ENV"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "KernelSU 集成完成, KSU_VERSION=$KSU_VERSION"
+
+      - name: 编译内核 (build.sh + thin LTO)
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          ccache -M 8G
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" 2>&1 | tee /tmp/build.log
+          exit "${PIPESTATUS[0]}"
+        env:
+          CCACHE_DIR: ~/.cache/ccache
+
+      - name: 校验产物
+        run: |
+          IMG="$KERNEL_ROOT/out/android12-5.10/dist/Image"
+          find "$KERNEL_ROOT/out/android12-5.10/dist/" -maxdepth 1 -type f -printf '%f\n' | head -20
+          strings "$IMG" | grep 'Linux version' || { echo "::error::Image 中未找到 Linux version"; exit 1; }
+
+      - name: 制作 AnyKernel3 刷机包
+        run: |
+          cd "$KERNEL_ROOT"
+          IMG="$KERNEL_ROOT/out/android12-5.10/dist/Image"
+          # 使用 GKI 适配版 AnyKernel3 (gki-2.0 分支)
+          git clone --depth 1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git "${{ github.workspace }}/AnyKernel3"
+          cd "${{ github.workspace }}/AnyKernel3"
+          rm -rf .git
+          cp "$IMG" ./Image
+          ZIP_NAME="marble-gki-5.10-${{ inputs.kernel_branch }}-ds${{ inputs.droidspaces_slot }}-AnyKernel3.zip"
+          zip -r "${{ github.workspace }}/$ZIP_NAME" ./*
+          echo "ZIP_PATH=${{ github.workspace }}/$ZIP_NAME" >> "$GITHUB_ENV"
+          ls -la "${{ github.workspace }}/$ZIP_NAME"
+
+      - name: 上传刷机包
+        uses: actions/upload-artifact@v6
+        with:
+          name: marble-gki-5.10-ds${{ inputs.droidspaces_slot }}
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
