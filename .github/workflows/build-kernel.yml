@@ -22,9 +22,14 @@ on:
           - 'android12-5.10-lts'
           - 'android12-5.10-2025-12'
           - 'android12-5.10-2025-09'
+      create_release:
+        description: '构建完成后发布到 GitHub Release (产物保留 90 天, 比 artifact 更适合长期保存)'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -206,3 +211,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 9
+
+      - name: 发布到 GitHub Release
+        if: inputs.create_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="marble-gki-ds${{ inputs.droidspaces_slot }}-${{ github.run_id }}"
+          {
+            echo "## marble GKI 5.10 内核刷机包"
+            echo ""
+            echo "- 内核分支: ${{ inputs.kernel_branch }}"
+            echo "- Droidspaces SYSVIPC 槽位: ${{ inputs.droidspaces_slot }}"
+            echo "- 包含: KernelSU (官方内置) + Droidspaces 容器支持"
+            echo "- 构建记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo "### 刷入方法"
+            echo "1. 手机进 fastboot: \`fastboot boot <OFRP/TWRP recovery.img>\`"
+            echo "2. Recovery 中 Install 刷入该 zip"
+            echo "3. 重启后安装 KernelSU Manager 获取 root"
+            echo ""
+            echo "### 注意"
+            echo "刷入后 bootloop 时, 用 123/345 槽位重新构建。"
+          } > notes.md
+          gh release create "$TAG" "$ZIP_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "marble GKI 5.10 - ds${{ inputs.droidspaces_slot }} (run #${{ github.run_number }})" \
+            --notes-file notes.md
+          echo "已发布 Release: $TAG"
