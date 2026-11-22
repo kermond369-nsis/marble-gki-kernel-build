@@ -20,10 +20,19 @@ on:
         default: 'android12-5.10-lts'
         options:
           - 'android12-5.10-lts'
-          - 'android12-5.10-2025-12'
-          - 'android12-5.10-2025-09'
+          - 'android12-5.10-2026-10'
+          - 'android12-5.10-2026-07'
+          - 'android12-5.10-2026-04'
+      ksu_channel:
+        description: 'KernelSU 版本渠道 (latest 为最新正式版 tag, main 为开发主线)'
+        required: true
+        type: choice
+        default: 'latest'
+        options:
+          - 'latest'
+          - 'main'
       create_release:
-        description: '构建完成后发布到 GitHub Release (产物保留 90 天, 比 artifact 更适合长期保存)'
+        description: '构建完成后发布到 GitHub Release (产物长期保存, 比 artifact 更适合留档)'
         required: false
         type: boolean
         default: true
@@ -33,10 +42,12 @@ permissions:
 
 jobs:
   build:
-    name: 'GKI ${{ inputs.kernel_branch }} / DS-${{ inputs.droidspaces_slot }}'
+    name: 'GKI ${{ inputs.kernel_branch }} / DS-${{ inputs.droidspaces_slot }} / KSU-${{ inputs.ksu_channel }}'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
+      # 必须使用绝对路径: GitHub Actions env 不会展开 ~, 否则 ccache 与 actions/cache 路径错位导致缓存完全失效
+      CCACHE_DIR: '${{ runner.temp }}/ccache'
       CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
       CCACHE_NOHASHDIR: 'true'
       CCACHE_HARDLINK: 'true'
@@ -67,7 +78,7 @@ jobs:
       - name: 恢复 ccache 缓存
         uses: actions/cache@v5
         with:
-          path: ~/.cache/ccache
+          path: ${{ runner.temp }}/ccache
           key: ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-${{ github.run_id }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-
@@ -79,11 +90,6 @@ jobs:
           curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "${{ github.workspace }}/git-repo/repo"
           chmod 0755 "${{ github.workspace }}/git-repo/repo"
           echo "${{ github.workspace }}/git-repo" >> "$GITHUB_PATH"
-
-      - name: 下载 AOSP build-tools
-        run: |
-          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-build-2024 --depth 1 "${{ github.workspace }}/kernel-build-tools"
-          echo "${{ github.workspace }}/kernel-build-tools/linux-x86/bin" >> "$GITHUB_PATH"
 
       - name: 同步 AOSP GKI 内核源码
         run: |
@@ -103,23 +109,25 @@ jobs:
       - name: 集成 Droidspaces 支持
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
+          SLOT="${{ inputs.droidspaces_slot }}"
+          if [ "$SLOT" = "off" ]; then
+            echo "Droidspaces 支持: 关闭 (跳过 kABI 补丁与 IPC/容器配置注入)"
+            exit 0
+          fi
+
           git clone --depth 1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
           PATCHES=/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI
-          SLOT="${{ inputs.droidspaces_slot }}"
 
-          if [ "$SLOT" != "off" ]; then
-            # 678 -> 6_7_8
-            SLOT_NAME=$(echo "$SLOT" | sed 's/\(.\)/\1_/g; s/_$//')
-            echo "应用 Droidspaces SYSVIPC kABI 修复补丁 (槽位: $SLOT_NAME)"
-            patch -p1 --forward < "$PATCHES/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_${SLOT_NAME}.patch" \
-              || echo "::warning::SYSVIPC 补丁应用失败(可能已应用或上下文不匹配)"
-            # 5.10 必须的 POSIX_MQUEUE kABI 补丁
-            echo "应用 Droidspaces POSIX_MQUEUE kABI 修复补丁 (5.10)"
-            patch -p1 --forward < "$PATCHES/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch" \
-              || echo "::warning::POSIX_MQUEUE 补丁应用失败(可能已应用或上下文不匹配)"
-          else
-            echo "Droidspaces 支持: 关闭"
-          fi
+          # 678 -> 6_7_8
+          SLOT_NAME=$(echo "$SLOT" | sed 's/\(.\)/\1_/g; s/_$//')
+          SYSVIPC_PATCH="$PATCHES/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_${SLOT_NAME}.patch"
+          MQUEUE_PATCH="$PATCHES/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+
+          # kABI 补丁为刚性前提, 任一失败必须立即中止构建, 避免静默产出 bootloop 镜像
+          echo "应用 Droidspaces SYSVIPC kABI 修复补丁 (槽位: $SLOT_NAME)"
+          patch -p1 --forward < "$SYSVIPC_PATCH"
+          echo "应用 Droidspaces POSIX_MQUEUE kABI 修复补丁 (5.10)"
+          patch -p1 --forward < "$MQUEUE_PATCH"
 
           echo "注入 Droidspaces 内核配置..."
           enable_config() {
@@ -147,7 +155,7 @@ jobs:
             fi
           }
 
-          # 必要配置
+          # 必要配置 (Droidspaces 官方 GKI 指南)
           enable_config CONFIG_SYSVIPC
           enable_config CONFIG_POSIX_MQUEUE
           enable_config CONFIG_IPC_NS
@@ -155,12 +163,19 @@ jobs:
           enable_config CONFIG_DEVTMPFS
           # 网络增强 (Docker/NAT)
           enable_config_if_defined CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
-          # 可选推荐
+          # 官方推荐的 kABI-safe 扩展配置
           enable_config_if_defined CONFIG_USER_NS
-          enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_REJECT
+          enable_config_if_defined CONFIG_IP6_NF_NAT
+          enable_config_if_defined CONFIG_IP6_NF_TARGET_MASQUERADE
+          enable_config_if_defined CONFIG_MACVLAN
+          enable_config_if_defined CONFIG_IP_NF_TARGET_REJECT
+          enable_config_if_defined CONFIG_IP6_NF_TARGET_REJECT
           enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_LOG
+          enable_config_if_defined CONFIG_NETFILTER_XT_MATCH_RECENT
           enable_config_if_defined CONFIG_IP_SET
           enable_config_if_defined CONFIG_IP_SET_HASH_IP
+          enable_config_if_defined CONFIG_IP_SET_HASH_NET
+          enable_config_if_defined CONFIG_NETFILTER_XT_SET
           enable_config_if_defined CONFIG_TMPFS_POSIX_ACL
           enable_config_if_defined CONFIG_TMPFS_XATTR
 
@@ -169,26 +184,42 @@ jobs:
         run: |
           # 禁用 AOSP savedefconfig 一致性校验 (追加式注入 config 会被 savedefconfig
           # 重排导致 diff 失败; zzh20188/GKI_KernelSU_SUSFS 同款做法, 社区验证)。
-          # 必须在 cd KernelSU 之前执行: 此后 cwd 变为 KernelSU/, 相对路径失效
+          # 必须在执行其他目录切换前运行, 保证相对路径有效
           sed -i 's/check_defconfig//' build.config.gki
           echo "已禁用 defconfig 一致性校验 (check_defconfig)"
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-          cd KernelSU
-          KSU_VERSION=$((20000 + $(git rev-list --count HEAD)))
-          echo "KSU_VERSION=$KSU_VERSION" >> "$GITHUB_ENV"
+
+          # 去除 uname -r 中的 -dirty 后缀
+          sed -i 's/-dirty//g' scripts/setlocalversion
+          echo "已去除 scripts/setlocalversion 中的 -dirty 后缀"
+
+          if [ "${{ inputs.ksu_channel }}" = "latest" ]; then
+            echo "拉取 KernelSU 最新正式版 tag..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s
+          else
+            echo "拉取 KernelSU main 主线..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          fi
+
+          KSU_TAG=$(git -C KernelSU describe --tags --always)
+          KSU_COMMIT=$(git -C KernelSU rev-parse --short HEAD)
+          echo "KSU_TAG=$KSU_TAG" >> "$GITHUB_ENV"
+          echo "KSU_COMMIT=$KSU_COMMIT" >> "$GITHUB_ENV"
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-          echo "KernelSU 集成完成, KSU_VERSION=$KSU_VERSION"
+          echo "KernelSU 集成完成: ref=$KSU_TAG (commit $KSU_COMMIT)"
 
       - name: 编译内核 (build.sh + thin LTO)
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
+          mkdir -p "$CCACHE_DIR"
           ccache -M 8G
+          ccache -z
           LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" 2>&1 | tee /tmp/build.log
-          exit "${PIPESTATUS[0]}"
-        env:
-          CCACHE_DIR: ~/.cache/ccache
+          BUILD_RC="${PIPESTATUS[0]}"
+          echo "=== ccache 统计 ==="
+          ccache -s
+          exit "$BUILD_RC"
 
-      - name: 校验产物
+      - name: 校验产物与最终配置
         run: |
           # dist 目录结构随构建版本变化, 用 find 定位而非硬编码路径
           IMG=$(find "$KERNEL_ROOT/out" -path '*/dist/Image' -type f | head -1)
@@ -200,7 +231,50 @@ jobs:
           echo "IMG=$IMG" >> "$GITHUB_ENV"
           echo "产物: $IMG"
           find "$(dirname "$IMG")" -maxdepth 1 -type f -printf '%f\n' | head -20
-          strings "$IMG" | grep 'Linux version' || { echo "::error::Image 中未找到 Linux version"; exit 1; }
+
+          LINUX_VER_LINE=$(strings "$IMG" | grep -m1 '^Linux version [0-9]' || true)
+          if [ -z "$LINUX_VER_LINE" ]; then
+            echo "::error::Image 中未找到 Linux version"
+            exit 1
+          fi
+          echo "$LINUX_VER_LINE"
+          KERNEL_RELEASE=$(echo "$LINUX_VER_LINE" | awk '{print $3}')
+          KSU_CODE=$(grep -oE 'KernelSU version: [0-9]+' /tmp/build.log | tail -1 | awk '{print $3}' || true)
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+          echo "KSU_CODE=${KSU_CODE:-unknown}" >> "$GITHUB_ENV"
+          echo "内核版本: $KERNEL_RELEASE"
+          echo "KernelSU 版本码: ${KSU_CODE:-unknown}"
+
+          # 校验最终 .config 关键配置确实通过 olddefconfig 生效
+          OUT_CONFIG=$(find "$KERNEL_ROOT/out" -path '*/common/.config' -type f | head -1)
+          if [ -z "$OUT_CONFIG" ]; then
+            echo "::error::未找到编译后的 .config"
+            exit 1
+          fi
+          echo "校验最终 .config: $OUT_CONFIG"
+          check_required_cfg() {
+            local cfg="$1"
+            if grep -q "^${cfg}=y" "$OUT_CONFIG"; then
+              echo "  [OK] ${cfg}=y"
+            else
+              echo "::error::关键配置未生效: $cfg"
+              exit 1
+            fi
+          }
+          check_required_cfg CONFIG_KSU
+          if [ "${{ inputs.droidspaces_slot }}" != "off" ]; then
+            for cfg in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+              check_required_cfg "$cfg"
+            done
+            echo "可选推荐配置状态:"
+            for cfg in CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_IP_NF_TARGET_REJECT CONFIG_IP6_NF_TARGET_REJECT CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+              if grep -q "^${cfg}=y" "$OUT_CONFIG"; then
+                echo "  [OK] ${cfg}=y"
+              else
+                echo "  [--] ${cfg} 未启用"
+              fi
+            done
+          fi
 
       - name: 制作 AnyKernel3 刷机包
         run: |
@@ -210,11 +284,36 @@ jobs:
           git clone --depth 1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git "${{ github.workspace }}/AnyKernel3"
           cd "${{ github.workspace }}/AnyKernel3"
           rm -rf .git
+          if [ "${{ inputs.droidspaces_slot }}" != "off" ]; then
+            AK_TITLE="marble GKI 5.10 (KernelSU + Droidspaces ds${{ inputs.droidspaces_slot }})"
+          else
+            AK_TITLE="marble GKI 5.10 (KernelSU)"
+          fi
+          sed -i "s|^kernel.string=.*|kernel.string=${AK_TITLE}|" anykernel.sh
           cp "$IMG" ./Image
           ZIP_NAME="marble-gki-5.10-${{ inputs.kernel_branch }}-ds${{ inputs.droidspaces_slot }}-AnyKernel3.zip"
-          zip -r "${{ github.workspace }}/$ZIP_NAME" ./*
-          echo "ZIP_PATH=${{ github.workspace }}/$ZIP_NAME" >> "$GITHUB_ENV"
-          ls -la "${{ github.workspace }}/$ZIP_NAME"
+          ZIP_PATH="${{ github.workspace }}/$ZIP_NAME"
+          zip -r "$ZIP_PATH" ./*
+          ZIP_SHA256=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+          echo "ZIP_SHA256=$ZIP_SHA256" >> "$GITHUB_ENV"
+          ls -lh "$ZIP_PATH"
+          echo "SHA256: $ZIP_SHA256"
+
+          # 写入 Actions Job Summary, 即使不发 Release 也能直接查看完整元数据
+          {
+            echo "### marble GKI 5.10 构建摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 内核分支 | \`${{ inputs.kernel_branch }}\` |"
+            echo "| 内核版本 | \`${KERNEL_RELEASE}\` |"
+            echo "| KernelSU | \`${KSU_TAG}\` (code: \`${KSU_CODE}\`, commit: \`${KSU_COMMIT}\`) |"
+            echo "| Droidspaces 槽位 | \`${{ inputs.droidspaces_slot }}\` |"
+            echo "| 刷机包 | \`${ZIP_NAME}\` |"
+            echo "| SHA256 | \`${ZIP_SHA256}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传刷机包
         uses: actions/upload-artifact@v6
@@ -231,24 +330,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="marble-gki-ds${{ inputs.droidspaces_slot }}-${{ github.run_id }}"
+          if [ "${{ inputs.droidspaces_slot }}" != "off" ]; then
+            FEATURES="KernelSU (官方内置) + Droidspaces 容器支持"
+          else
+            FEATURES="KernelSU (官方内置, 未启用 Droidspaces)"
+          fi
           {
             echo "## marble GKI 5.10 内核刷机包"
             echo ""
-            echo "- 内核分支: ${{ inputs.kernel_branch }}"
-            echo "- Droidspaces SYSVIPC 槽位: ${{ inputs.droidspaces_slot }}"
-            echo "- 包含: KernelSU (官方内置) + Droidspaces 容器支持"
+            echo "- 内核分支: \`${{ inputs.kernel_branch }}\`"
+            echo "- 内核版本: \`${KERNEL_RELEASE}\`"
+            echo "- KernelSU: \`${KSU_TAG}\` (version code: \`${KSU_CODE}\`, commit: \`${KSU_COMMIT}\`)"
+            echo "- Droidspaces SYSVIPC 槽位: \`${{ inputs.droidspaces_slot }}\`"
+            echo "- 包含特性: ${FEATURES}"
+            echo "- SHA256: \`${ZIP_SHA256}\`"
             echo "- 构建记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo ""
             echo "### 刷入方法"
             echo "1. 手机进 fastboot: \`fastboot boot <OFRP/TWRP recovery.img>\`"
             echo "2. Recovery 中 Install 刷入该 zip"
-            echo "3. 重启后安装 KernelSU Manager 获取 root"
-            echo ""
-            echo "### 注意"
-            echo "刷入后 bootloop 时, 用 123/345 槽位重新构建。"
+            echo "3. 重启后安装对应版本的 KernelSU Manager 获取 root"
+            if [ "${{ inputs.droidspaces_slot }}" != "off" ]; then
+              echo ""
+              echo "### 注意"
+              echo "刷入后若出现 bootloop, 请换用 \`123\` 或 \`345\` 槽位重新构建。"
+            fi
           } > notes.md
           gh release create "$TAG" "$ZIP_PATH" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "marble GKI 5.10 - ds${{ inputs.droidspaces_slot }} (run #${{ github.run_number }})" \
+            --title "marble GKI ${KERNEL_RELEASE} - ds${{ inputs.droidspaces_slot }} (run #${{ github.run_number }})" \
             --notes-file notes.md
           echo "已发布 Release: $TAG"
