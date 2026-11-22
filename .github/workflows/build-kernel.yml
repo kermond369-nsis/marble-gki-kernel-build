@@ -46,8 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # 必须使用绝对路径: GitHub Actions env 不会展开 ~, 否则 ccache 与 actions/cache 路径错位导致缓存完全失效
-      CCACHE_DIR: '${{ runner.temp }}/ccache'
+      # 必须使用绝对路径: GitHub Actions env 不会展开 ~, 且 job 级 env 不支持 runner 上下文
+      CCACHE_DIR: '${{ github.workspace }}/.ccache'
       CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
       CCACHE_NOHASHDIR: 'true'
       CCACHE_HARDLINK: 'true'
@@ -78,7 +78,7 @@ jobs:
       - name: 恢复 ccache 缓存
         uses: actions/cache@v5
         with:
-          path: ${{ runner.temp }}/ccache
+          path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-${{ github.run_id }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ inputs.kernel_branch }}-
